@@ -6,7 +6,7 @@ from typing import List
 
 import torch
 import torch.distributed as dist
-
+from cuda.cuda import CUdevice_attribute, cuDeviceGetAttribute
 
 class DisaggregationMode(Enum):
     NULL = "null"
@@ -73,3 +73,16 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         }
         return class_mapping.get(class_type)
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
+
+def check_gdr_support():
+    cuda_version = float(torch.version.cuda)
+    if cuda_version >= 11.3:
+        current_device = torch.cuda.current_device()
+
+        err, gdr_support = cuDeviceGetAttribute(
+            CUdevice_attribute.CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED,
+            current_device
+        )
+
+        return bool(gdr_support)
+    return False
