@@ -14,6 +14,9 @@ import numpy as np
 import numpy.typing as npt
 import requests
 import zmq
+import ctypes
+import torch
+import pycuda.driver as cuda
 from aiohttp import web
 
 from sglang.srt.disaggregation.base.conn import (
@@ -28,6 +31,7 @@ from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferE
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
+from sglang.srt.disaggregation.utils import check_gdr_support
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +95,14 @@ class TransferInfo:
             dst_aux_index=int(msg[7].decode("ascii")),
         )
 
+@dataclasses.dataclass
+class CPUKVArgs:
+    kv_data_ptrs: list[torch.tensor]
+
+    @classmethod
+    def from_ptr(cls, kv_ptrs: list[torch.tensor]):
+        return cls(kv_data_ptrs=kv_ptrs)
+
 
 class MooncakeKVManager(BaseKVManager):
     def __init__(
@@ -108,6 +120,9 @@ class MooncakeKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
+        self.gdr_support = False #check_gdr_support()
+        self.cpu_buffer = None
+        self.init_cpu_fallback_buffer()
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_queue = queue.Queue()
@@ -123,28 +138,51 @@ class MooncakeKVManager(BaseKVManager):
             )
 
     def register_buffer_to_engine(self):
-        for kv_data_ptr, kv_data_len in zip(
-            self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-        ):
-            self.engine.register(kv_data_ptr, kv_data_len)
+        if self.gdr_support:
+            for kv_data_ptr, kv_data_len in zip(
+                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+            ):
+                self.engine.register(kv_data_ptr, kv_data_len)
+
+        else:
+            for kv_data_ptr, kv_data_len in zip(
+                self.cpu_buffer.kv_data_ptrs, self.kv_args.kv_data_lens
+            ):
+                self.engine.register(kv_data_ptr.data_ptr(), kv_data_len)
 
         for aux_data_ptr, aux_data_len in zip(
             self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
         ):
             self.engine.register(aux_data_ptr, aux_data_len)
 
+
+    def init_cpu_fallback_buffer(self):
+        if self.gdr_support:
+            return
+
+        kv_cpu_buffer = [
+            torch.zeros(
+                self.kv_args.kv_data_lens[i],
+                dtype=torch.int8,
+                device='cpu'
+            ) for i in range(len(self.kv_args.kv_data_ptrs))
+        ]
+
+        self.cpu_buffer = CPUKVArgs.from_ptr(kv_cpu_buffer)
+
     @cache
     def _connect(self, endpoint: str):
         socket = zmq.Context().socket(zmq.PUSH)
         socket.connect(endpoint)
         return socket
-
-    def send_kvcache(
+    
+    def _send_kvcache(
         self,
         mooncake_session_id: str,
         prefill_kv_indices: npt.NDArray[np.int64],
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int64],
+        fast: bool,
     ):
         # group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
@@ -153,7 +191,7 @@ class MooncakeKVManager(BaseKVManager):
 
         num_layers = len(self.kv_args.kv_data_ptrs)
         for layer_id in range(num_layers):
-            src_ptr = self.kv_args.kv_data_ptrs[layer_id]
+            src_ptr = self.kv_args.kv_data_ptrs[layer_id] if fast else self.cpu_buffer.kv_data_ptrs[layer_id].data_ptr()
             dst_ptr = dst_kv_ptrs[layer_id]
             item_len = self.kv_args.kv_item_lens[layer_id]
 
@@ -171,6 +209,40 @@ class MooncakeKVManager(BaseKVManager):
 
         return 0
 
+    def fill_cpu_kv_buffer(self, kv_indices: npt.NDArray[np.int64]):
+        for layer_id in range(len(self.kv_args.kv_data_ptrs)):
+            item_len = self.kv_args.kv_item_lens[layer_id]
+            for index in kv_indices:
+                offset = int(index * item_len)
+                gpu_addr = self.kv_args.kv_data_ptrs[layer_id] + offset
+                cpu_buffer = np.zeros(item_len, dtype=np.int8)
+                cpu_addr = self.cpu_buffer.kv_data_ptrs[layer_id].data_ptr() + offset
+                cuda.memcpy_dtoh(cpu_buffer, gpu_addr)
+                ctypes.memmove(ctypes.c_void_p(cpu_addr), cpu_buffer.ctypes.data_as(ctypes.c_void_p), item_len)
+
+    def send_kvcache(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int64],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int64],
+    ):
+        if self.gdr_support:
+            return self._send_kvcache(
+                mooncake_session_id,
+                prefill_kv_indices,
+                dst_kv_ptrs,
+                dst_kv_indices,
+                True
+            )
+        return self._send_kvcache(
+                mooncake_session_id,
+                prefill_kv_indices,
+                dst_kv_ptrs,
+                dst_kv_indices,
+                False
+            )
+
     def send_aux(
         self,
         mooncake_session_id: str,
@@ -180,7 +252,8 @@ class MooncakeKVManager(BaseKVManager):
     ):
         aux_item_len = self.kv_args.aux_item_lens[0]
         prefill_aux_addr = (
-            self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
+            self.kv_args.aux_data_ptrs[0]
+            + prefill_aux_index * aux_item_len
         )
         decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
         # TODO: mooncake transfer engine can do async transfer. Do async later
@@ -218,8 +291,9 @@ class MooncakeKVManager(BaseKVManager):
                 # NOTE: after bootstrapping we can mark the req as waiting for input
                 self.request_status[room] = KVPoll.WaitingForInput
 
-        def transfer_thread():
+        def transfer_thread(device_id):
             # TODO: Shall we use KVPoll.Transferring state?
+            torch.cuda.set_device(device_id)
             while True:
                 try:
                     kv_chunk: TransferKVChunk = self.transfer_queue.get(timeout=0.01)
@@ -262,7 +336,7 @@ class MooncakeKVManager(BaseKVManager):
                     continue
 
         threading.Thread(target=bootstrap_thread).start()
-        threading.Thread(target=transfer_thread).start()
+        threading.Thread(target=transfer_thread, args=(torch.cuda.current_device(),)).start()
 
     def start_decode_thread(self):
         self.rank_port = get_free_port()
@@ -343,6 +417,17 @@ class MooncakeKVManager(BaseKVManager):
         except Exception as e:
             logger.error(f"Prefill Failed to register to bootstrap server: {e}")
 
+    def fill_gpu_kv_buffer(self, kv_indices: npt.NDArray[np.int64]):
+        for layer_id in range(len(self.kv_args.kv_data_ptrs)):
+            item_len = self.kv_args.kv_item_lens[layer_id]
+            for index in kv_indices:
+                offset = int(index * item_len)
+                gpu_addr = self.kv_args.kv_data_ptrs[layer_id] + offset
+                cpu_addr = self.cpu_buffer.kv_data_ptrs[layer_id].data_ptr() + offset
+                cpu_buffer = np.empty(item_len, dtype=np.int8)
+                ctypes.memmove(cpu_buffer.ctypes.data_as(ctypes.c_void_p), ctypes.c_void_p(cpu_addr), item_len)
+                cuda.memcpy_htod(gpu_addr, cpu_buffer)
+
 
 class MooncakeKVSender(BaseKVSender):
 
@@ -366,6 +451,8 @@ class MooncakeKVSender(BaseKVSender):
         index_slice: slice,
         is_last: bool,
     ):
+        if not self.kv_mgr.gdr_support:
+            self.kv_mgr.fill_cpu_kv_buffer(kv_indices)
         if not is_last:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room, kv_indices, index_slice, False
@@ -443,6 +530,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
         return socket
 
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+        self.kv_indices = kv_indices
+        self.aux_index = aux_index
         self.prefill_server_url = (
             f"{self.bootstrap_info['rank_ip']}:{self.bootstrap_info['rank_port']}"
         )
@@ -450,12 +539,18 @@ class MooncakeKVReceiver(BaseKVReceiver):
             f"Fetched bootstrap info: {self.bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
         )
 
-        packed_kv_data_ptrs = b"".join(
-            struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-        )
+        if self.kv_mgr.gdr_support:
+            packed_kv_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+            )
+        else:
+            packed_kv_data_ptrs = b"".join(
+                struct.pack("Q", ptr.data_ptr()) for ptr in self.kv_mgr.cpu_buffer.kv_data_ptrs
+            )
         packed_aux_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
         )
+            
         self._connect("tcp://" + self.prefill_server_url).send_multipart(
             [
                 str(self.bootstrap_room).encode("ascii"),
@@ -470,7 +565,11 @@ class MooncakeKVReceiver(BaseKVReceiver):
         )
 
     def poll(self) -> KVPoll:
-        return self.kv_mgr.check_status(self.bootstrap_room)
+        status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status == KVPoll.Success and not self.kv_mgr.gdr_support:
+            self.kv_mgr.fill_gpu_kv_buffer(self.kv_indices)
+
+        return status
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
