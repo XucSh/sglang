@@ -120,7 +120,8 @@ class MooncakeKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
-        self.gdr_support = check_gdr_support()
+        self.gdr_support = False #check_gdr_support()
+        self.cpu_buffer = None
         self.init_cpu_fallback_buffer()
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -137,15 +138,26 @@ class MooncakeKVManager(BaseKVManager):
             )
 
     def register_buffer_to_engine(self):
-        for kv_data_ptr, kv_data_len in zip(
-            self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-        ):
-            self.engine.register(kv_data_ptr, kv_data_len)
+        if self.gdr_support:
+            for kv_data_ptr, kv_data_len in zip(
+                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+            ):
+                self.engine.register(kv_data_ptr, kv_data_len)
 
-        for aux_data_ptr, aux_data_len in zip(
-            self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
-        ):
-            self.engine.register(aux_data_ptr, aux_data_len)
+            for aux_data_ptr, aux_data_len in zip(
+                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+            ):
+                self.engine.register(aux_data_ptr, aux_data_len)
+        else:
+            for kv_data_ptr, kv_data_len in zip(
+                self.cpu_buffer.kv_data_ptrs, self.kv_args.kv_data_lens
+            ):
+                self.engine.register(kv_data_ptr, kv_data_len)
+
+            for aux_data_ptr, aux_data_len in zip(
+                self.cpu_buffer.aux_data_ptrs, self.kv_args.aux_data_lens
+            ):
+                self.engine.register(aux_data_ptr, aux_data_len)
 
     def init_cpu_fallback_buffer(self):
         if self.gdr_support:
