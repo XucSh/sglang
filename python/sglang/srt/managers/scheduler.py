@@ -137,7 +137,7 @@ from sglang.srt.managers.scheduler_metrics_mixin import (
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.scheduler_pp_mixin import ChunkSizePredictor, SchedulerPPMixin
 from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
@@ -525,6 +525,8 @@ class Scheduler(
 
         # Init overlap
         self.init_overlap()
+
+        self.init_pp_profile()
 
         # Init mlp sync flag
         self.require_mlp_sync = require_mlp_sync(server_args)
@@ -957,6 +959,16 @@ class Scheduler(
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+    def init_pp_profile(self):
+        if self.pp_size == 1:
+            return
+        self.length_predictor = ChunkSizePredictor()
+        self.enable_dynamic_chunking = (
+            self.pp_size > 1
+            and self.chunked_prefill_size is not None
+            and self.chunked_prefill_size > 0
+        )
 
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
@@ -1786,6 +1798,21 @@ class Scheduler(
             # in the waiting queue.
             return None
 
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input()
+
+        current_chunk_size = self.chunked_prefill_size
+        if (
+            self.enable_dynamic_chunking
+            and self.length_predictor.is_ready
+            and self.chunked_req is not None
+        ):
+            history_len = len(self.chunked_req.prefix_indices)
+            dynamic_size = self.length_predictor.predict_next_chunk_size(history_len)
+
+            if dynamic_size is not None:
+                current_chunk_size = dynamic_size
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -1794,13 +1821,12 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
-            self.chunked_prefill_size,
+            current_chunk_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -2741,6 +2767,7 @@ def run_scheduler_process(
             if scheduler.enable_pdmux:
                 scheduler.event_loop_pdmux()
             elif server_args.pp_size > 1:
+                scheduler.profile_pp_prefill_latency()
                 scheduler.event_loop_pp()
             elif scheduler.enable_overlap:
                 scheduler.event_loop_overlap()
@@ -2751,6 +2778,7 @@ def run_scheduler_process(
                 scheduler.event_loop_overlap_disagg_prefill()
             else:
                 if server_args.pp_size > 1:
+                    scheduler.profile_pp_prefill_latency()
                     scheduler.event_loop_pp_disagg_prefill()
                 else:
                     scheduler.event_loop_normal_disagg_prefill()

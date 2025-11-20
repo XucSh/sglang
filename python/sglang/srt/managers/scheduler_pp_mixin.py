@@ -3,26 +3,75 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass
+import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+from sglang.srt.mem_cache.common import release_kv_cache
 import torch
+import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode, poll_and_all_reduce
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+
+class ChunkSizePredictor:
+    def __init__(self):
+        self.coeffs = None # [a, b, c] for T = aL^2 + bL + c
+        self.target_latency = None
+        self.is_ready = False
+        self.current_chunk_size = None
+
+    def fit(self, seq_lens, latencies):
+        self.coeffs = np.polyfit(seq_lens, latencies, 2)
+        self.is_ready = True
+        logger.info(f"Latency model fitted: T = {self.coeffs[0]:.2e}*L^2 + {self.coeffs[1]:.2e}*L + {self.coeffs[2]:.2e}")
+
+    def set_target_latency(self, base_chunk_size):
+        if not self.is_ready:
+            return
+        self.target_latency = np.polyval(self.coeffs, base_chunk_size)
+        logger.info(f"Target latency set to {self.target_latency:.4f}s (based on chunk size {base_chunk_size})")
+
+    def predict_next_chunk_size(self, current_history_len):
+        if not self.is_ready or self.target_latency is None:
+            return None
+
+        a, b, _ = self.coeffs
+
+        A = a
+        B = 2 * a * current_history_len + b
+        C = -self.target_latency
+
+        delta = B**2 - 4 * A * C
+
+        if delta < 0:
+            logger.warning("Latency predictor delta < 0, fallback to default.")
+            return None
+
+        if abs(A) < 1e-12: 
+            s = -C / B
+        else:
+            s = (-B + np.sqrt(delta)) / (2 * A)
+
+        self.current_chunk_size = int(s)
+        return self.current_chunk_size
+
+    def get_current_chunk_size(self):
+        return self.current_chunk_size
 
 
 @dataclass
@@ -31,6 +80,77 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    def profile_pp_prefill_latency(self: Scheduler):
+        seq_lens = []
+        latencies = []
+        if self.pp_group.is_first_rank:
+            logger.info("Profiling prefill latency for dynamic chunk sizing...")
+
+            input_ids = [
+                np.random.randint(
+                    0, 10000, size=(self.chunked_prefill_size // (2**i)), dtype=np.int64
+                )
+                for i in range(5)
+            ]
+            sampling_params = SamplingParams(
+                temperature=0,
+                max_new_tokens=1,
+            )
+
+            reqs = []
+            for i in range(len(input_ids)):
+                req = Req(
+                    rid=i,
+                    origin_input_text="",
+                    origin_input_ids=list(input_ids[i]),
+                    sampling_params=sampling_params,
+                )
+                req.fill_ids = req.origin_input_ids
+                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                req.logprob_start_len = len(req.origin_input_ids) - 1
+                reqs.append(req)
+                seq_lens.append(len(input_ids[i]))
+
+            for req in reqs:
+                batch = ScheduleBatch.init_new(
+                    [req],
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    self.tree_cache,
+                    self.model_config,
+                    False,
+                    self.spec_algorithm
+                )
+
+                current_seq_len = len(req.fill_ids)
+                proxy_tensors = {
+                    "hidden_states": torch.zeros(
+                        (current_seq_len, self.tp_worker.model_runner.model_config.hidden_size),
+                        dtype=self.tp_worker.model_runner.model_config.dtype,
+                        device="cuda",
+                    ),
+                    "residual": torch.zeros(
+                        (current_seq_len, self.tp_worker.model_runner.model_config.hidden_size),
+                        dtype=self.tp_worker.model_runner.model_config.dtype,
+                        device="cuda",
+                    ),
+                }
+                pp_proxy = PPProxyTensors(proxy_tensors)
+                start = time.perf_counter()
+                batch.prepare_for_extend()
+                model_worker_batch = batch.get_model_worker_batch()
+                forward_batch = ForwardBatch.init_new(model_worker_batch, self.tp_worker.model_runner)
+                _, _ = self.tp_worker.model_runner.forward(forward_batch=forward_batch, pp_proxy_tensors=pp_proxy)
+
+                latencies.append(time.perf_counter() - start)
+                release_kv_cache(req, self.tree_cache)
+
+        data_to_sync = [seq_lens, latencies]
+        self.pp_group.broadcast_object_list(data_to_sync, src=0)
+        seq_lens, latencies = data_to_sync
+        self.length_predictor.fit(seq_lens, latencies)
+        self.length_predictor.set_target_latency(self.chunked_prefill_size)
+
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         for p2p_work in work:
             p2p_work.work.wait()
