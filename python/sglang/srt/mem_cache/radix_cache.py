@@ -229,6 +229,8 @@ class RadixCache(BasePrefixCache):
             raise ValueError(
                 f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority'."
             )
+
+        self.evictable_leaves = set()
         self.reset()
 
     @classmethod
@@ -260,6 +262,7 @@ class RadixCache(BasePrefixCache):
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        self.evictable_leaves.clear()
         self._record_all_cleared_event()
 
     def maybe_bigram_convert(
@@ -481,7 +484,7 @@ class RadixCache(BasePrefixCache):
             return
 
         start_time = time.perf_counter()
-        leaves = self._collect_leaves()
+        leaves = list(self.evictable_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
@@ -513,6 +516,8 @@ class RadixCache(BasePrefixCache):
                 self.evictable_size_ -= len(node.key)
                 self.protected_size_ += len(node.key)
                 delta -= len(node.key)
+                if node in self.evictable_leaves:
+                    self.evictable_leaves.remove(node)
             node.lock_ref += 1
             node = node.parent
         return delta
@@ -528,6 +533,8 @@ class RadixCache(BasePrefixCache):
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
             node.lock_ref -= 1
+            if node.lock_ref == 0 and len(node.children) == 0:
+                self.evictable_leaves.add(node)
             if node.parent is None:
                 assert (
                     node is self.root_node
@@ -640,6 +647,10 @@ class RadixCache(BasePrefixCache):
             new_node.value = value
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
+            if node in self.evictable_leaves:
+                self.evictable_leaves.remove(node)
+            if new_node.lock_ref == 0:
+                self.evictable_leaves.add(new_node)
             self._record_store_event(new_node)
         return total_prefix_length
 
@@ -662,11 +673,15 @@ class RadixCache(BasePrefixCache):
                 ), f"{key=}, {self.get_child_key_fn(child.key)=}"
 
     def _delete_leaf(self, node):
+        if node in self.evictable_leaves:
+            self.evictable_leaves.remove(node)
         for k, v in node.parent.children.items():
             if v == node:
                 break
         del node.parent.children[k]
         self.evictable_size_ -= len(node.key)
+        if len(node.parent.children) == 0 and node.parent.lock_ref == 0:
+            self.evictable_leaves.add(node.parent)
 
     def _total_size_helper(self):
         total_size = 0
@@ -679,20 +694,6 @@ class RadixCache(BasePrefixCache):
                     continue
                 stack.append(child)
         return total_size
-
-    def _collect_leaves(self):
-        ret_list = []
-        stack = list(self.root_node.children.values())
-
-        while stack:
-            cur_node = stack.pop()
-            if len(cur_node.children) == 0:
-                if cur_node.lock_ref == 0:
-                    ret_list.append(cur_node)
-            else:
-                stack.extend(cur_node.children.values())
-
-        return ret_list
 
     def _record_store_event(self, node: TreeNode):
         # One BlockStored per ``page_size`` chunk.
