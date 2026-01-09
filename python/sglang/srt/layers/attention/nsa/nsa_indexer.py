@@ -408,6 +408,7 @@ class Indexer(MultiPlatformOp):
         # Compute cu_seqlens for batched kernel
         # Use get_seqlens_int32 to avoid CPU-to-GPU copy
         seqlens = metadata.get_seqlens_int32()
+        cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
         torch.cumsum(seqlens, dim=0, out=cu_seqlens[1:])
         total_tokens = cu_seqlens[-1].item()
         
