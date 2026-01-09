@@ -1756,6 +1756,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         layer_id: int,
         block_tables: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        token_to_batch_idx: torch.Tensor,
         total_tokens: int,
     ):
         """
@@ -1764,6 +1765,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         :param layer_id: Layer index
         :param block_tables: (batch_size, num_blocks), int32
         :param cu_seqlens: (batch_size + 1,), int32
+        :param token_to_batch_idx: (total_tokens,), int32
         :param total_tokens: int, sum of seqlens
         :return: tuple of (k_fp8, k_scale) where
                  k_fp8: (total_tokens, index_head_dim), uint8
@@ -1775,6 +1777,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             buf,
             block_tables=block_tables,
             cu_seqlens=cu_seqlens,
+            token_to_batch_idx=token_to_batch_idx,
             total_tokens=total_tokens,
         )
 

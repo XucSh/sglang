@@ -681,6 +681,7 @@ def _get_k_and_s_triton_kernel(
     tl.store(s_out_ptr + s_dst_offset + s_offsets, s_data)
 
 
+
 class GetBatchedKAndS:
     @classmethod
     def execute(cls, *args, **kwargs):
@@ -693,12 +694,14 @@ class GetBatchedKAndS:
         buf,
         block_tables: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        token_to_batch_idx: torch.Tensor,
         total_tokens: int,
     ):
         """
         Triton implementation for gathering both K and S data from paged buffer in a single call for a batch.
         :param block_tables: (batch_size, num_blocks), int32
         :param cu_seqlens: (batch_size + 1,), int32
+        :param token_to_batch_idx: (total_tokens,), int32
         :param total_tokens: int, sum of seqlens
         :return: tuple of (k_out, s_out) where
                  k_out: (total_tokens, index_head_dim), uint8
@@ -708,6 +711,7 @@ class GetBatchedKAndS:
             buf=buf,
             block_tables=block_tables,
             cu_seqlens=cu_seqlens,
+            token_to_batch_idx=token_to_batch_idx,
             total_tokens=total_tokens,
             page_size=pool.page_size,
             index_head_dim=pool.index_head_dim,
@@ -718,6 +722,7 @@ def _get_batched_k_and_s_triton(
     buf: torch.Tensor,
     block_tables: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
     total_tokens: int,
     page_size: int,
     index_head_dim: int,
@@ -738,9 +743,9 @@ def _get_batched_k_and_s_triton(
         buf,
         block_tables,
         cu_seqlens,
+        token_to_batch_idx,
         k_out,
         s_out,
-        batch_size,
         page_size,
         buf_numel_per_page,
         index_head_dim,
@@ -757,9 +762,9 @@ def _get_batched_k_and_s_triton_kernel(
     buf_ptr,
     block_tables_ptr,
     cu_seqlens_ptr,
+    token_to_batch_idx_ptr,
     k_out_ptr,
     s_out_ptr,
-    batch_size: tl.constexpr,
     page_size: tl.constexpr,
     buf_numel_per_page: tl.constexpr,
     index_head_dim: tl.constexpr,
@@ -769,19 +774,8 @@ def _get_batched_k_and_s_triton_kernel(
 ):
     token_id = tl.program_id(0)
 
-    # Binary search to find batch_idx
-    # Find the largest i such that cu_seqlens[i] <= token_id
-    low = 0
-    high = batch_size
-    while low < high:
-        mid = (low + high + 1) // 2
-        start_token = tl.load(cu_seqlens_ptr + mid)
-        if start_token <= token_id:
-            low = mid
-        else:
-            high = mid - 1
-    
-    batch_idx = low
+    # Direct lookup of batch_idx
+    batch_idx = tl.load(token_to_batch_idx_ptr + token_id)
     seq_start = tl.load(cu_seqlens_ptr + batch_idx)
     local_token_idx = token_id - seq_start
 

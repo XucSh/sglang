@@ -412,12 +412,15 @@ class Indexer(MultiPlatformOp):
         cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
         torch.cumsum(seqlens, dim=0, out=cu_seqlens[1:])
         total_tokens = cu_seqlens[-1].item()
+        
+        token_to_batch_idx = metadata.get_token_to_batch_idx()
 
         # Use batched fused Triton kernel
         k_fp8, k_scale = forward_batch.token_to_kv_pool.get_batched_index_k_scale_buffer(
             layer_id,
             block_tables,
             cu_seqlens,
+            token_to_batch_idx,
             total_tokens,
         )
 
@@ -426,7 +429,8 @@ class Indexer(MultiPlatformOp):
         kv_fp8 = (k_fp8, k_scale)
         ks, ke = metadata.get_indexer_kvcache_range()
         seq_lens_expanded = metadata.get_seqlens_expanded()
-        token_to_batch_idx = metadata.get_token_to_batch_idx()
+        
+        # token_to_batch_idx is already retrieved above
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
 
