@@ -679,3 +679,139 @@ def _get_k_and_s_triton_kernel(
     # Store S to output
     s_dst_offset = token_id * 4
     tl.store(s_out_ptr + s_dst_offset + s_offsets, s_data)
+
+
+class GetBatchedKAndS:
+    @classmethod
+    def execute(cls, *args, **kwargs):
+        return cls.triton(*args, **kwargs)
+
+    @classmethod
+    def triton(
+        cls,
+        pool: "NSATokenToKVPool",
+        buf,
+        block_tables: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        total_tokens: int,
+    ):
+        """
+        Triton implementation for gathering both K and S data from paged buffer in a single call for a batch.
+        :param block_tables: (batch_size, num_blocks), int32
+        :param cu_seqlens: (batch_size + 1,), int32
+        :param total_tokens: int, sum of seqlens
+        :return: tuple of (k_out, s_out) where
+                 k_out: (total_tokens, index_head_dim), uint8
+                 s_out: (total_tokens, 4), uint8
+        """
+        return _get_batched_k_and_s_triton(
+            buf=buf,
+            block_tables=block_tables,
+            cu_seqlens=cu_seqlens,
+            total_tokens=total_tokens,
+            page_size=pool.page_size,
+            index_head_dim=pool.index_head_dim,
+        )
+
+
+def _get_batched_k_and_s_triton(
+    buf: torch.Tensor,
+    block_tables: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    total_tokens: int,
+    page_size: int,
+    index_head_dim: int,
+):
+    num_pages, buf_numel_per_page = buf.shape
+    s_offset_in_page = page_size * index_head_dim
+    batch_size = cu_seqlens.shape[0] - 1
+
+    # Allocate outputs
+    k_out = torch.empty(
+        (total_tokens, index_head_dim), dtype=torch.uint8, device=buf.device
+    )
+    s_out = torch.empty((total_tokens, 4), dtype=torch.uint8, device=buf.device)
+
+    # Launch kernel with one thread per token
+    grid = (total_tokens,)
+    _get_batched_k_and_s_triton_kernel[grid](
+        buf,
+        block_tables,
+        cu_seqlens,
+        k_out,
+        s_out,
+        batch_size,
+        page_size,
+        buf_numel_per_page,
+        index_head_dim,
+        s_offset_in_page,
+        block_tables.stride(0),
+        BLOCK_SIZE_K=128,
+    )
+
+    return k_out, s_out
+
+
+@triton.jit
+def _get_batched_k_and_s_triton_kernel(
+    buf_ptr,
+    block_tables_ptr,
+    cu_seqlens_ptr,
+    k_out_ptr,
+    s_out_ptr,
+    batch_size: tl.constexpr,
+    page_size: tl.constexpr,
+    buf_numel_per_page: tl.constexpr,
+    index_head_dim: tl.constexpr,
+    s_offset_in_page: tl.constexpr,
+    stride_bt_0,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+
+    # Binary search to find batch_idx
+    # Find the largest i such that cu_seqlens[i] <= token_id
+    low = 0
+    high = batch_size
+    while low < high:
+        mid = (low + high + 1) // 2
+        start_token = tl.load(cu_seqlens_ptr + mid)
+        if start_token <= token_id:
+            low = mid
+        else:
+            high = mid - 1
+    
+    batch_idx = low
+    seq_start = tl.load(cu_seqlens_ptr + batch_idx)
+    local_token_idx = token_id - seq_start
+
+    # Calculate page
+    page_idx_in_req = local_token_idx // page_size
+    token_offset_in_page = local_token_idx % page_size
+
+    # Load page index from block tables
+    # block_tables is (batch, num_blocks), so offset is batch_idx * stride_0 + page_idx
+    page_index = tl.load(block_tables_ptr + batch_idx * stride_bt_0 + page_idx_in_req)
+
+    # ===== Load K data (128 bytes) =====
+    k_src_base_offset = (
+        page_index * buf_numel_per_page + token_offset_in_page * index_head_dim
+    )
+
+    k_offsets = tl.arange(0, BLOCK_SIZE_K)
+    k_mask = k_offsets < index_head_dim
+    k_data = tl.load(buf_ptr + k_src_base_offset + k_offsets, mask=k_mask)
+
+    k_dst_offset = token_id * index_head_dim
+    tl.store(k_out_ptr + k_dst_offset + k_offsets, k_data, mask=k_mask)
+
+    # ===== Load S data (4 bytes) =====
+    s_src_base_offset = (
+        page_index * buf_numel_per_page + s_offset_in_page + token_offset_in_page * 4
+    )
+
+    s_offsets = tl.arange(0, 4)
+    s_data = tl.load(buf_ptr + s_src_base_offset + s_offsets)
+
+    s_dst_offset = token_id * 4
+    tl.store(s_out_ptr + s_dst_offset + s_offsets, s_data)

@@ -1751,6 +1751,33 @@ class NSATokenToKVPool(MLATokenToKVPool):
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
 
+    def get_batched_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        block_tables: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        total_tokens: int,
+    ):
+        """
+        Fused method to get both index K and scale data in a single call using Triton for a batch.
+
+        :param layer_id: Layer index
+        :param block_tables: (batch_size, num_blocks), int32
+        :param cu_seqlens: (batch_size + 1,), int32
+        :param total_tokens: int, sum of seqlens
+        :return: tuple of (k_fp8, k_scale) where
+                 k_fp8: (total_tokens, index_head_dim), uint8
+                 k_scale: (total_tokens, 4), uint8
+        """
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return index_buf_accessor.GetBatchedKAndS.execute(
+            self,
+            buf,
+            block_tables=block_tables,
+            cu_seqlens=cu_seqlens,
+            total_tokens=total_tokens,
+        )
+
     def set_index_k_scale_buffer(
         self,
         layer_id: int,

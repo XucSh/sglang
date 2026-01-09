@@ -386,8 +386,7 @@ class Indexer(MultiPlatformOp):
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
-        k_fp8_list = []
-        k_scale_list = []
+
 
         block_tables = metadata.get_page_table_64()
 
@@ -407,20 +406,23 @@ class Indexer(MultiPlatformOp):
 
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         assert len(indexer_seq_lens_cpu) == batch_size
-        for i in range(batch_size):
-            seq_len = indexer_seq_lens_cpu[i].item()
-            assert isinstance(seq_len, int)
-            # Use fused Triton kernel to get both K and scale in a single call
-            k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
-                layer_id,
-                seq_len,
-                block_tables[i],
-            )
-            k_fp8_list.append(k_fp8)
-            k_scale_list.append(k_scale)
+        
+        # Compute cu_seqlens for batched kernel
+        seqlens = indexer_seq_lens_cpu.to(device, dtype=torch.int32, non_blocking=True)
+        cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+        torch.cumsum(seqlens, dim=0, out=cu_seqlens[1:])
+        total_tokens = cu_seqlens[-1].item()
 
-        k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
-        k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
+        # Use batched fused Triton kernel
+        k_fp8, k_scale = forward_batch.token_to_kv_pool.get_batched_index_k_scale_buffer(
+            layer_id,
+            block_tables,
+            cu_seqlens,
+            total_tokens,
+        )
+
+        k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+        k_scale = k_scale.view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
         ks, ke = metadata.get_indexer_kvcache_range()
         seq_lens_expanded = metadata.get_seqlens_expanded()
