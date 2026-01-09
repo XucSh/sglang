@@ -762,9 +762,9 @@ def _get_batched_k_and_s_triton_kernel(
     buf_ptr,
     block_tables_ptr,
     cu_seqlens_ptr,
-    token_to_batch_idx_ptr,
     k_out_ptr,
     s_out_ptr,
+    batch_size: tl.constexpr,
     page_size: tl.constexpr,
     buf_numel_per_page: tl.constexpr,
     index_head_dim: tl.constexpr,
@@ -774,8 +774,19 @@ def _get_batched_k_and_s_triton_kernel(
 ):
     token_id = tl.program_id(0)
 
-    # Direct lookup of batch_idx
-    batch_idx = tl.load(token_to_batch_idx_ptr + token_id)
+    # Binary search to find batch_idx
+    # Find the largest i such that cu_seqlens[i] <= token_id
+    low = 0
+    high = batch_size
+    while low < high:
+        mid = (low + high + 1) // 2
+        start_token = tl.load(cu_seqlens_ptr + mid)
+        if start_token <= token_id:
+            low = mid
+        else:
+            high = mid - 1
+    
+    batch_idx = low
     seq_start = tl.load(cu_seqlens_ptr + batch_idx)
     local_token_idx = token_id - seq_start
 
@@ -785,7 +796,7 @@ def _get_batched_k_and_s_triton_kernel(
 
     # Load page index from block tables
     # block_tables is (batch, num_blocks), so offset is batch_idx * stride_0 + page_idx
-    page_index = tl.load(block_tables_ptr + batch_idx * stride_bt_0 + page_idx_in_req)
+    page_index = tl.load(block_tables_ptr + batch_idx * stride_bt_0 + page_idx_in_req).to(tl.int64)
 
     # ===== Load K data (128 bytes) =====
     k_src_base_offset = (
