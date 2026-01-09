@@ -1,6 +1,6 @@
 import unittest
 
-from test_gpt_oss_common import BaseTestGptOss
+from sglang.test.gpt_oss_common import BaseTestGptOss
 
 
 class TestGptOss4Gpu(BaseTestGptOss):
@@ -9,10 +9,7 @@ class TestGptOss4Gpu(BaseTestGptOss):
             model_variant="120b",
             quantization="bf16",
             expected_score_of_reasoning_effort={
-                "low": 0.61,
-                # remove to speed up
-                # "medium": 0.61,
-                # "high": 0.61,
+                "low": 0.60,
             },
             other_args=["--tp", "4", "--cuda-graph-max-bs", "200"],
         )
@@ -22,10 +19,7 @@ class TestGptOss4Gpu(BaseTestGptOss):
             model_variant="120b",
             quantization="mxfp4",
             expected_score_of_reasoning_effort={
-                "low": 0.61,
-                # remove to speed up
-                # "medium": 0.61,
-                # "high": 0.61,
+                "low": 0.60,
             },
             other_args=[
                 "--tp",

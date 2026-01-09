@@ -1,33 +1,40 @@
 from __future__ import annotations
 
-import importlib.util
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
     is_hip,
+    next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
-
-has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -39,6 +46,11 @@ if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+
+try:
+    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+except ImportError:
+    flashinfer_cutlass_fused_moe = None
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -114,13 +126,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:
                 x = x.view(-1, x.shape[-1])
             output = torch.ops.sgl_kernel.weight_packed_linear(
-                x, layer.weight, bias, True  # is_vnni
+                x,
+                layer.weight,
+                bias,
+                True,  # is_vnni
             )
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
@@ -129,33 +143,25 @@ class UnquantizedLinearMethod(LinearMethodBase):
         return F.linear(x, layer.weight, bias)
 
 
-class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
+class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     """MoE method without quantization."""
 
-    def __init__(self, use_triton_kernels: bool = False):
+    def __init__(
+        self, use_triton_kernels: bool = False, use_flashinfer_trtllm_moe: bool = False
+    ):
         super().__init__()
+        self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
-
-        self.triton_kernel_moe_forward = None
-        self.triton_kernel_moe_with_bias_forward = None
-        if torch.cuda.is_available() and has_triton_kernels:
-            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-                triton_kernel_moe_forward as _tk_forward,
-            )
-            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-                triton_kernel_moe_with_bias_forward as _tk_with_bias_forward,
-            )
-
-            self.triton_kernel_moe_forward = _tk_forward
-            self.triton_kernel_moe_with_bias_forward = _tk_with_bias_forward
+        self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
+        self._cache_permute_indices = dict({})
 
     def create_weights(
         self,
         layer: torch.nn.Module,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: int,
+        intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         with_bias: bool = False,
         **extra_weight_attrs,
@@ -163,7 +169,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self.with_bias = with_bias
 
         # Fused gate_up_proj (column parallel)
-        w13_weight_n, w13_weight_k = 2 * intermediate_size, hidden_size
+        w13_up_dim = (
+            2 * intermediate_size_per_partition
+            if layer.moe_runner_config.is_gated
+            else intermediate_size_per_partition
+        )
+        w13_weight_n, w13_weight_k = (w13_up_dim, hidden_size)
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
         w13_weight = torch.nn.Parameter(
@@ -175,7 +186,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         if self.with_bias:
             w13_weight_bias = torch.nn.Parameter(
-                torch.empty(num_experts, 2 * intermediate_size, dtype=torch.float32),
+                torch.empty(num_experts, w13_up_dim, dtype=torch.float32),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_bias", w13_weight_bias)
@@ -184,7 +195,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # down_proj (row parallel)
         w2_weight_n, w2_weight_k = (
             hidden_size,
-            intermediate_size,
+            intermediate_size_per_partition,
         )
         if self.use_triton_kernels:
             w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
@@ -220,54 +231,140 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
+        # Reorder rows of W1 for fused gated activation
+        if self.use_flashinfer_trtllm_moe:
+            from flashinfer.fused_moe.core import (
+                _maybe_get_cached_w3_w1_permute_indices,
+                convert_to_block_layout,
+                get_w2_permute_indices_with_cache,
+            )
+
+            # w1 and w3 have been swapped, so we don't need do that here
+            epilogue_tile_m = 128
+            block_k = 128
+            old_shape_w13 = layer.w13_weight.data[0].shape
+            old_shape_w2 = layer.w2_weight.data[0].shape
+            new_shape_w13 = None
+            new_shape_w2 = None
+            for i in range(layer.num_local_experts):
+                permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+                    self._cache_permute_indices,
+                    layer.w13_weight.data[i].view(torch.uint8),
+                    epilogue_tile_m,
+                )
+                tmp_weights1 = (
+                    layer.w13_weight.data[i]
+                    .clone()
+                    .view(torch.uint8)[permute_indices.to(layer.w13_weight.data.device)]
+                    .contiguous()
+                )
+
+                permute_indices = get_w2_permute_indices_with_cache(
+                    self._cache_permute_indices,
+                    layer.w2_weight.data[i].view(torch.uint8),
+                    epilogue_tile_m,
+                )
+                tmp_weights2 = (
+                    layer.w2_weight.data[i]
+                    .clone()
+                    .view(torch.uint8)[permute_indices.to(layer.w2_weight.data.device)]
+                    .contiguous()
+                )
+
+                tmp_weights1 = convert_to_block_layout(
+                    tmp_weights1.view(torch.uint8), block_k
+                )
+                tmp_weights2 = convert_to_block_layout(
+                    tmp_weights2.view(torch.uint8), block_k
+                )
+
+                new_shape_w13 = tmp_weights1.view(torch.bfloat16).shape
+                new_shape_w2 = tmp_weights2.view(torch.bfloat16).shape
+                layer.w13_weight.data[i] = (
+                    tmp_weights1.view(torch.bfloat16)
+                    .contiguous()
+                    .reshape(old_shape_w13)
+                )
+                layer.w2_weight.data[i] = (
+                    tmp_weights2.view(torch.bfloat16).contiguous().reshape(old_shape_w2)
+                )
+
+            layer.w13_weight.data = layer.w13_weight.data.reshape(
+                layer.num_local_experts, *new_shape_w13
+            )
+            layer.w2_weight.data = layer.w2_weight.data.reshape(
+                layer.num_local_experts, *new_shape_w2
+            )
+
         return
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        backend = (
+            MoeRunnerBackend.TRITON_KERNELS
+            if self.use_triton_kernels
+            else MoeRunnerBackend.TRITON
+        )
+        self.runner = MoeRunner(backend, moe_runner_config)
+
+    @property
+    def load_up_proj_weight_first(self) -> bool:
+        # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13
+        return self.use_flashinfer_cutlass
 
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
-
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
         return self.forward(
-            x=x,
             layer=layer,
-            topk_output=topk_output,
-            moe_runner_config=moe_runner_config,
+            dispatch_output=dispatch_output,
         )
 
     def forward_cuda(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        if self.use_triton_kernels:
-            if self.with_bias:
-                assert self.triton_kernel_moe_with_bias_forward is not None
-                return self.triton_kernel_moe_with_bias_forward(
-                    hidden_states=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    b1=layer.w13_weight_bias,
-                    b2=layer.w2_weight_bias,
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
-                    w1_pcg=None,
-                    w2_pcg=None,
-                )
-            else:
-                assert self.triton_kernel_moe_forward is not None
-                return self.triton_kernel_moe_forward(
-                    hidden_states=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
-                )
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        moe_runner_config = self.moe_runner_config
+
+        backend = self.runner.runner_backend
+        if backend.is_triton_kernels():
+            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
+                TritonKernelsQuantInfo,
+            )
+
+            quant_info = TritonKernelsQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
+        elif self.use_flashinfer_cutlass:
+            output = flashinfer_cutlass_fused_moe(
+                input=x,
+                token_selected_experts=topk_output.topk_ids,
+                token_final_scales=topk_output.topk_weights,
+                fc1_expert_weights=layer.w13_weight,
+                fc2_expert_weights=layer.w2_weight,
+                output_dtype=x.dtype,
+                quant_scales=None,
+                ep_size=layer.moe_ep_size,
+                ep_rank=layer.moe_ep_rank,
+                tp_size=layer.moe_tp_size,
+                tp_rank=layer.moe_tp_rank,
+                tune_max_num_tokens=next_power_of_2(x.shape[0]),
+            )[0]
+            return StandardCombineInput(hidden_states=output)
         else:
             if _use_aiter:
                 assert not moe_runner_config.no_combine, "unsupported"
@@ -284,7 +381,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     topk_weights = torch.ones_like(
                         topk_weights, dtype=torch.float32
                     )  # topk_weights must be FP32 (float32)
-                return fused_moe(
+                output = fused_moe(
                     x,
                     layer.w13_weight,
                     layer.w2_weight,
@@ -295,44 +392,42 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                         if moe_runner_config.activation == "silu"
                         else ActivationType.Gelu
                     ),
+                    expert_mask=layer.expert_mask_gpu,
                 )
+                return StandardCombineInput(hidden_states=output)
             else:
-                from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-                    fused_experts,
-                )
-
-                return fused_experts(
-                    hidden_states=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    b1=getattr(layer, "w13_weight_bias", None),
+                quant_info = TritonMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    b13=getattr(layer, "w13_weight_bias", None),
                     b2=getattr(layer, "w2_weight_bias", None),
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
                 )
+                return self.runner.run(dispatch_output, quant_info)
 
     def forward_cpu(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        moe_runner_config = self.moe_runner_config
+
         assert (
             moe_runner_config.activation == "silu"
         ), f"activation = {moe_runner_config.activation} is not supported."
 
-        if (
-            use_intel_amx_backend(layer)
-            and not moe_runner_config.apply_router_weight_on_input
-        ):
+        if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
             topk_weights, topk_ids, _ = topk_output
             x, topk_weights = apply_topk_weights_cpu(
                 moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
-            return torch.ops.sgl_kernel.fused_experts_cpu(
+            output = torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -348,33 +443,102 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 None,  # a2_scale
                 True,  # is_vnni
             )
+            return StandardCombineInput(hidden_states=output)
         else:
             from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 
-            return moe_forward_native(
+            output = moe_forward_native(
                 layer,
                 x,
                 topk_output,
                 moe_runner_config,
             )
+            return StandardCombineInput(hidden_states=output)
 
     def forward_npu(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        import torch_npu
 
-        return moe_forward_native(
-            layer,
-            x,
-            topk_output,
-            moe_runner_config,
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+
+        original_dtype = x.dtype
+        num_tokens = x.shape[0]
+        topk_weights = topk_weights.to(x.dtype)
+        topk_ids = topk_ids.to(torch.int32)
+        num_experts = layer.num_experts
+        top_k = layer.top_k
+        row_idx_len = num_tokens * top_k
+        row_idx = (
+            torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
+            .view(top_k, -1)
+            .permute(1, 0)
+            .contiguous()
         )
 
-    def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
+        hidden_states, expanded_row_idx, expanded_expert_idx = (
+            torch_npu.npu_moe_init_routing(
+                x, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
+            )
+        )
+
+        expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
+            expanded_expert_idx, num_experts
+        )
+
+        expert_tokens = expert_tokens.to(torch.int64)
+        if layer.w13_weight.shape[-1] == layer.hidden_size:
+            w13 = layer.w13_weight.transpose(1, 2)
+            w2 = layer.w2_weight.transpose(1, 2)
+
+        # gmm1: gate_up_proj
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[w13],
+            split_item=2,
+            group_list_type=0,
+            group_type=0,
+            group_list=expert_tokens,
+            output_dtype=original_dtype,
+        )[0]
+
+        # act_fn:
+        if self.moe_runner_config.activation == "silu":
+            hidden_states = torch_npu.npu_swiglu(hidden_states)
+        else:
+            from sglang.srt.layers.activation import GeluAndMul
+
+            hidden_states = GeluAndMul()(hidden_states)
+
+        # gmm2: down_proj
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[w2],
+            split_item=2,
+            group_list_type=0,
+            group_type=0,
+            group_list=expert_tokens,
+            output_dtype=original_dtype,
+        )[0]
+
+        final_hidden_states = torch_npu.npu_moe_finalize_routing(
+            hidden_states,
+            skip1=None,
+            skip2=None,
+            bias=None,
+            scales=topk_weights,
+            expanded_src_to_dst_row=expanded_row_idx,
+            export_for_source_row=topk_ids,
+        )
+
+        return StandardCombineInput(hidden_states=final_hidden_states)
+
+    def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
 
     forward_native = forward_cpu
